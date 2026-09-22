@@ -77,6 +77,17 @@ class LockScreenOverlayManager private constructor(
         private const val PROMPT_RETRY_DELAY_MS = 600L
         private const val MAX_PROMPT_RETRIES = 2
 
+        /**
+         * Some OEM builds (Samsung One UI) cancel a biometric prompt whose caller is not the
+         * top task, so a prompt started from a service dies with BIOMETRIC_ERROR_CANCELED about
+         * a second after it appears. Once that has been observed the prompt is hosted in
+         * [TransparentBiometricActivity] for the rest of the process lifetime. Samsung devices
+         * start out in that mode so the first lock does not waste a doomed attempt.
+         */
+        @Volatile
+        private var useActivityHostedPrompt: Boolean =
+            Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+
         fun forAccessibilityService(service: AccessibilityService): LockScreenOverlayManager =
             LockScreenOverlayManager(
                 service,
@@ -253,6 +264,11 @@ class LockScreenOverlayManager private constructor(
     fun onForegroundPackageChanged(packageName: String) {
         if (!isShowing) return
         if (packageName == lockedPackageName || packageName == hostContext.packageName) return
+        if (promptActive || packageName.startsWith("com.samsung.android.biometrics")) {
+            // The biometric UI (or our prompt-hosting activity) is what came to the front,
+            // not the user leaving the app.
+            return
+        }
         LogUtils.d(TAG, "Foreground moved to $packageName while locking $lockedPackageName, dismissing")
         removeOverlay()
     }
@@ -370,6 +386,7 @@ class LockScreenOverlayManager private constructor(
         mainHandler.removeCallbacks(autoPromptRunnable)
         mainHandler.removeCallbacks(retryPromptRunnable)
         biometricPrompt?.cancel()
+        TransparentBiometricActivity.cancelCurrent()
         promptActive = false
         removeShield()
 
@@ -429,15 +446,16 @@ class LockScreenOverlayManager private constructor(
 
     private fun startBiometricAuth(userInitiated: Boolean) {
         if (!isShowing) return
+        if (!appLockRepository.isBiometricAuthEnabled()) return
+        if (promptActive) return
+
         val prompt = biometricPrompt
-        if (prompt == null) {
-            // API < 28: no framework prompt usable from a service. Fall back to the old
-            // activity based flow, which needs the overlay out of the way.
-            startLegacyBiometricActivity()
+        if (prompt == null || useActivityHostedPrompt) {
+            // Either no framework prompt (API < 28) or this device refuses service-side
+            // prompts: host it in our own activity while the overlay stays underneath.
+            startActivityHostedPrompt(userInitiated)
             return
         }
-        if (prompt.isActive) return
-        if (!appLockRepository.isBiometricAuthEnabled()) return
 
         if (userInitiated) promptRetries = 0
         biometricStatus = null
@@ -491,9 +509,13 @@ class LockScreenOverlayManager private constructor(
             }
 
             BiometricPrompt.BIOMETRIC_ERROR_CANCELED -> {
-                // Cancelled by the system, typically because the locked app was still
-                // switching activities while the prompt came up. Retry a couple of times.
-                if (promptRetries < MAX_PROMPT_RETRIES) {
+                if (!useActivityHostedPrompt) {
+                    // The system killed a prompt started from the service. Switch to hosting
+                    // it in our own activity, which this device is happy with.
+                    useActivityHostedPrompt = true
+                    LogUtils.d(TAG, "Service-side biometric prompt cancelled, switching to activity-hosted prompt")
+                    startActivityHostedPrompt(userInitiated = false)
+                } else if (promptRetries < MAX_PROMPT_RETRIES) {
                     promptRetries++
                     LogUtils.d(TAG, "Biometric prompt cancelled by system, retry $promptRetries")
                     mainHandler.postDelayed(retryPromptRunnable, PROMPT_RETRY_DELAY_MS)
@@ -586,20 +608,62 @@ class LockScreenOverlayManager private constructor(
         }
     }
 
-    /** Pre-Android 9 fallback: AndroidX prompt inside a transparent activity. */
-    private fun startLegacyBiometricActivity() {
+    /**
+     * Shows the AndroidX prompt inside [TransparentBiometricActivity]. The lock overlay stays
+     * attached but hidden (the activity is opaque and covers the app), and comes back if the
+     * prompt does not succeed.
+     */
+    private fun startActivityHostedPrompt(userInitiated: Boolean) {
         val packageName = lockedPackageName ?: return
-        val intent = Intent(hostContext, TransparentBiometricActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION
-            putExtra("locked_package", packageName)
+        if (userInitiated) promptRetries = 0
+        biometricStatus = null
+
+        // The activity sits below any overlay window, so ours must get out of the way.
+        removeShield()
+        rootView?.visibility = View.INVISIBLE
+        promptActive = true
+
+        TransparentBiometricActivity.resultListener = { success, errorCode ->
+            runOnMain {
+                promptActive = false
+                if (!isShowing || lockedPackageName != packageName) return@runOnMain
+                if (success) {
+                    LogUtils.d(TAG, "Activity-hosted biometric auth succeeded for $packageName")
+                    handleUnlock()
+                } else {
+                    LogUtils.d(TAG, "Activity-hosted biometric auth failed: $errorCode")
+                    when (errorCode) {
+                        androidx.biometric.BiometricPrompt.ERROR_NEGATIVE_BUTTON -> {
+                            restoreWindowsAfterPrompt()
+                            uiMode = LockUiMode.CREDENTIAL_ENTRY
+                        }
+
+                        TransparentBiometricActivity.ERROR_FAILED_TO_START -> {
+                            restoreWindowsAfterPrompt()
+                            uiMode = LockUiMode.CREDENTIAL_ENTRY
+                        }
+
+                        else -> handleBiometricError(errorCode, "")
+                    }
+                }
+            }
         }
-        AppLockManager.reportBiometricAuthStarted()
-        detachAll()
+
+        val intent = Intent(hostContext, TransparentBiometricActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                    Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+            putExtra(TransparentBiometricActivity.EXTRA_LOCKED_PACKAGE, packageName)
+            putExtra(TransparentBiometricActivity.EXTRA_APP_NAME, lockedAppName)
+        }
         try {
             hostContext.startActivity(intent)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start legacy biometric activity", e)
-            AppLockManager.reportBiometricAuthFinished()
+            Log.e(TAG, "Failed to start biometric activity", e)
+            TransparentBiometricActivity.resultListener = null
+            promptActive = false
+            restoreWindowsAfterPrompt()
+            if (uiMode == LockUiMode.BIOMETRIC_ONLY) uiMode = LockUiMode.CREDENTIAL_ENTRY
         }
     }
 
