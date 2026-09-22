@@ -3,6 +3,7 @@ package dev.pranav.applock.services
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
@@ -10,11 +11,14 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import dev.pranav.applock.MainActivity
 import dev.pranav.applock.R
 import dev.pranav.applock.core.broadcast.DeviceAdmin
 import dev.pranav.applock.core.utils.LogUtils
@@ -22,7 +26,7 @@ import dev.pranav.applock.core.utils.appLockRepository
 import dev.pranav.applock.data.repository.AppLockRepository
 import dev.pranav.applock.data.repository.AppLockRepository.Companion.shouldStartService
 import dev.pranav.applock.data.repository.BackendImplementation
-import dev.pranav.applock.features.lockscreen.ui.PasswordOverlayActivity
+import dev.pranav.applock.features.lockscreen.ui.LockScreenHost
 import dev.pranav.applock.shizuku.ShizukuActivityManager
 import rikka.shizuku.Shizuku
 
@@ -30,10 +34,37 @@ class ShizukuAppLockService : Service() {
     private val appLockRepository: AppLockRepository by lazy { applicationContext.appLockRepository() }
     private var shizukuActivityManager: ShizukuActivityManager? = null
     private var previousForegroundPackage = ""
+    private val lockScreenHost: LockScreenHost by lazy { LockScreenHost(this) }
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val notificationManager: NotificationManager by lazy {
         getSystemService(NotificationManager::class.java)
     }
+
+    /**
+     * The Shizuku binder arrives asynchronously through the ShizukuProvider, usually a moment
+     * after our process starts (e.g. right after boot). Instead of giving up when it is not
+     * there yet, the service stays alive and starts monitoring as soon as it shows up.
+     */
+    private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
+        LogUtils.d(TAG, "Shizuku binder received")
+        mainHandler.post { startMonitoringIfReady() }
+    }
+
+    private val binderDeadListener = Shizuku.OnBinderDeadListener {
+        Log.w(TAG, "Shizuku binder died, waiting for it to come back")
+        mainHandler.post {
+            stopMonitoring()
+            updateNotification(getString(R.string.shizuku_service_waiting))
+        }
+    }
+
+    private val permissionResultListener =
+        Shizuku.OnRequestPermissionResultListener { _, grantResult ->
+            if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                mainHandler.post { startMonitoringIfReady() }
+            }
+        }
 
     companion object {
         private const val TAG = "ShizukuAppLockService"
@@ -42,6 +73,9 @@ class ShizukuAppLockService : Service() {
 
         @Volatile
         var isServiceRunning = false
+
+        @Volatile
+        var isMonitoring = false
     }
 
     override fun onCreate() {
@@ -53,42 +87,50 @@ class ShizukuAppLockService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         LogUtils.d(TAG, "ShizukuAppLockService started. Running: $isServiceRunning")
 
-        if (isServiceRunning) return START_STICKY
-        isServiceRunning = true
-
-        if (!shouldStartService(appLockRepository, this::class.java) || !isShizukuAvailable()) {
-            Log.e(TAG, "Service not needed or Shizuku not ready. Stopping service.")
+        if (!shouldStartService(appLockRepository, this::class.java)) {
+            Log.e(TAG, "Service not needed. Stopping service.")
             isServiceRunning = false
             stopSelf()
             return START_NOT_STICKY
         }
+
+        if (isServiceRunning) {
+            startMonitoringIfReady()
+            return START_STICKY
+        }
+        isServiceRunning = true
 
         appLockRepository.setActiveBackend(BackendImplementation.SHIZUKU)
         AppLockManager.stopAllOtherServices(this, this::class.java)
 
-        setupShizukuActivityManager()
-
-        val shizukuStarted = shizukuActivityManager?.start() == true
-        if (!shizukuStarted) {
-            Log.e(TAG, "Shizuku failed to start. Stopping service.")
-            isServiceRunning = false
-            stopSelf()
-            return START_NOT_STICKY
+        try {
+            Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
+            Shizuku.addBinderDeadListener(binderDeadListener)
+            Shizuku.addRequestPermissionResultListener(permissionResultListener)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register Shizuku listeners", e)
         }
 
+        startMonitoringIfReady()
         return START_STICKY
     }
 
     override fun onDestroy() {
         LogUtils.d(TAG, "ShizukuAppLockService killed.")
 
-        shizukuActivityManager?.stop()
-
-        if (isServiceRunning) {
-            LogUtils.d(TAG, "Service destroyed unexpectedly. Automatic fallback is disabled.")
+        try {
+            Shizuku.removeBinderReceivedListener(binderReceivedListener)
+            Shizuku.removeBinderDeadListener(binderDeadListener)
+            Shizuku.removeRequestPermissionResultListener(permissionResultListener)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister Shizuku listeners", e)
         }
 
+        stopMonitoring()
+        lockScreenHost.destroy()
+
         isServiceRunning = false
+        AppLockManager.isLockScreenShown.set(false)
         notificationManager.cancel(NOTIFICATION_ID)
         super.onDestroy()
     }
@@ -98,11 +140,7 @@ class ShizukuAppLockService : Service() {
         if (shouldStartService(appLockRepository, this::class.java)) {
             try {
                 val startIntent = Intent(this, ShizukuAppLockService::class.java)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    ContextCompat.startForegroundService(this, startIntent)
-                } else {
-                    startService(startIntent)
-                }
+                ContextCompat.startForegroundService(this, startIntent)
                 LogUtils.d(TAG, "Re-started ShizukuAppLockService after task removal")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to restart service after task removal", e)
@@ -112,19 +150,58 @@ class ShizukuAppLockService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onUnbind(intent: Intent?): Boolean {
-        LogUtils.d(TAG, "ShizukuAppLockService unbound. Automatic fallback is disabled.")
-        return super.onUnbind(intent)
+    private fun isShizukuReady(): Boolean {
+        return try {
+            Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (e: Exception) {
+            Log.w(TAG, "Shizuku state check failed", e)
+            false
+        }
     }
 
-    private fun isShizukuAvailable(): Boolean {
-        return Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+    private fun startMonitoringIfReady() {
+        if (!isServiceRunning || isMonitoring) return
+
+        if (!Shizuku.pingBinder()) {
+            Log.w(TAG, "Shizuku binder not available yet, waiting")
+            updateNotification(getString(R.string.shizuku_service_waiting))
+            return
+        }
+
+        if (!isShizukuReady()) {
+            Log.w(TAG, "Shizuku permission not granted, waiting")
+            updateNotification(getString(R.string.shizuku_service_permission_missing))
+            return
+        }
+
+        if (shizukuActivityManager == null) {
+            setupShizukuActivityManager()
+        }
+
+        val started = shizukuActivityManager?.start() == true
+        if (!started) {
+            Log.e(TAG, "Shizuku monitoring failed to start")
+            updateNotification(getString(R.string.shizuku_service_waiting))
+            return
+        }
+
+        isMonitoring = true
+        previousForegroundPackage = ""
+        updateNotification(getString(R.string.shizuku_service_protecting))
+        LogUtils.d(TAG, "Shizuku monitoring started")
     }
 
-    @RequiresApi(Build.VERSION_CODES.P)
+    private fun stopMonitoring() {
+        if (!isMonitoring && shizukuActivityManager == null) return
+        shizukuActivityManager?.stop()
+        shizukuActivityManager = null
+        isMonitoring = false
+        lockScreenHost.dismiss()
+    }
+
     private fun startForegroundService() {
         createNotificationChannel()
-        val notification = createNotification()
+        val notification = createNotification(getString(R.string.shizuku_service_waiting))
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             val type = determineForegroundServiceType()
@@ -158,23 +235,45 @@ class ShizukuAppLockService : Service() {
         notificationManager.createNotificationChannel(serviceChannel)
     }
 
-    private fun createNotification(): Notification {
+    private fun createNotification(text: String): Notification {
+        val openApp = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("AppLock")
-            .setContentText("Protecting your apps with Shizuku")
+            .setContentText(text)
+            .setContentIntent(openApp)
             .setSmallIcon(R.drawable.baseline_shield_24)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setOngoing(true)
             .build()
     }
 
+    private fun updateNotification(text: String) {
+        try {
+            notificationManager.notify(NOTIFICATION_ID, createNotification(text))
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update notification", e)
+        }
+    }
+
     private fun setupShizukuActivityManager() {
         shizukuActivityManager =
             ShizukuActivityManager(this, appLockRepository) { packageName, _, timeMillis ->
+                if (packageName == this.packageName) {
+                    return@ShizukuActivityManager
+                }
+
                 val triggeringPackage = previousForegroundPackage
                 previousForegroundPackage = packageName
 
-                if (AppLockManager.isLockScreenShown.get() || packageName == this.packageName) {
+                // Dismiss a lock screen the user has navigated away from.
+                lockScreenHost.onForegroundPackageChanged(packageName)
+
+                if (AppLockManager.isLockScreenShown.get()) {
                     return@ShizukuActivityManager
                 }
 
@@ -227,29 +326,15 @@ class ShizukuAppLockService : Service() {
             AppLockManager.appUnlockTimes.remove(packageName)
         }
 
-        if (AppLockManager.isLockScreenShown.get()) {
-            LogUtils.d(TAG, "Lock screen already shown, skipping")
+        if (AppLockManager.isLockScreenShown.get() ||
+            AppLockManager.currentBiometricState == AppLockAccessibilityService.BiometricState.AUTH_STARTED
+        ) {
+            LogUtils.d(TAG, "Lock screen already shown or biometric auth in progress, skipping")
             return
         }
 
-        LogUtils.d(TAG, "Locked app detected: $packageName. Showing overlay.")
+        LogUtils.d(TAG, "Locked app detected: $packageName. Showing lock screen.")
         AppLockManager.isLockScreenShown.set(true)
-
-        val intent = Intent(this, PasswordOverlayActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
-                    Intent.FLAG_ACTIVITY_NO_ANIMATION or
-                    Intent.FLAG_FROM_BACKGROUND or
-                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-            putExtra("locked_package", packageName)
-            putExtra("triggering_package", triggeringPackage)
-        }
-
-        try {
-            startActivity(intent)
-        } catch (e: Exception) {
-            AppLockManager.isLockScreenShown.set(false)
-            Log.e(TAG, "Failed to start password overlay: ${e.message}", e)
-        }
+        lockScreenHost.showLockScreen(packageName, triggeringPackage)
     }
 }

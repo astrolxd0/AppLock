@@ -65,6 +65,13 @@ Make sure you have Shizuku installed and enabled via ADB. Tap \'Next\' to grant 
     <string name="unlock_app_title">Unlock %1$s</string>
     <string name="confirm_biometric_subtitle">Confirm biometric to continue</string>
     <string name="use_pin_button">Use PIN</string>
+    <string name="close_button_cd">Close</string>
+    <string name="biometric_prompt_interrupted">Biometric prompt was interrupted. Tap to try again.</string>
+    <string name="shizuku_service_waiting">Waiting for Shizuku…</string>
+    <string name="shizuku_service_permission_missing">Shizuku permission missing. Open App Lock to grant it.</string>
+    <string name="shizuku_service_protecting">Protecting your apps with Shizuku</string>
+    <string name="settings_screen_biometric_first_title">Biometrics First</string>
+    <string name="settings_screen_biometric_first_desc">Ask for biometrics right away instead of showing the PIN screen. Dismissing the prompt leaves the app; tap \'Use PIN\' to enter your PIN instead.</string>
     <string name="enter_password_to_continue">Enter password to continue</string>
     <string name="biometric_authentication_cd">Biometric Authentication</string>
 

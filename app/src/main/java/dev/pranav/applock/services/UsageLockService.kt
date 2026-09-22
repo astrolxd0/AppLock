@@ -26,7 +26,7 @@ import dev.pranav.applock.core.utils.hasUsagePermission
 import dev.pranav.applock.data.repository.AppLockRepository
 import dev.pranav.applock.data.repository.AppLockRepository.Companion.shouldStartService
 import dev.pranav.applock.data.repository.BackendImplementation
-import dev.pranav.applock.features.lockscreen.ui.PasswordOverlayActivity
+import dev.pranav.applock.features.lockscreen.ui.LockScreenHost
 import java.util.Timer
 import kotlin.concurrent.timerTask
 
@@ -48,6 +48,7 @@ class UsageLockService: Service() {
     private var timer: Timer? = null
     private var previousForegroundPackage = ""
     private var pauseMonitoring = false
+    private val lockScreenHost: LockScreenHost by lazy { LockScreenHost(this) }
 
     private val screenStateReceiver = object: android.content.BroadcastReceiver() {
         override fun onReceive(context: android.content.Context?, intent: Intent?) {
@@ -101,6 +102,7 @@ class UsageLockService: Service() {
             Log.w(TAG, "Receiver not registered or already unregistered")
         }
 
+        lockScreenHost.destroy()
         AppLockManager.isLockScreenShown.set(false)
         notificationManager.cancel(NOTIFICATION_ID)
         super.onDestroy()
@@ -152,6 +154,10 @@ class UsageLockService: Service() {
             )
 
             if (isExclusionApp(currentPackage)) return
+
+            // User left the locked app (home, recents, another app): drop the lock screen so
+            // it does not sit on top of whatever is in front now.
+            lockScreenHost.onForegroundPackageChanged(currentPackage)
 
             if (triggeringPackage in appLockRepository.getTriggerExcludedApps()) {
                 return
@@ -264,25 +270,9 @@ class UsageLockService: Service() {
             return
         }
 
-        LogUtils.d(TAG, "Locked app: $packageName. Showing overlay.")
+        LogUtils.d(TAG, "Locked app: $packageName. Showing lock screen.")
         AppLockManager.isLockScreenShown.set(true)
-
-        val intent = Intent(this, PasswordOverlayActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
-                    Intent.FLAG_ACTIVITY_NO_ANIMATION or
-                    Intent.FLAG_FROM_BACKGROUND or
-                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-            putExtra("locked_package", packageName)
-            putExtra("triggering_package", triggeringPackage)
-        }
-
-        try {
-            startActivity(intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error starting overlay for: $packageName", e)
-            AppLockManager.isLockScreenShown.set(false)
-        }
+        lockScreenHost.showLockScreen(packageName, triggeringPackage)
     }
 
     private fun startForegroundService() {

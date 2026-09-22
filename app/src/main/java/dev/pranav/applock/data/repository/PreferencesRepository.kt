@@ -74,6 +74,19 @@ class PreferencesRepository(context: Context) {
         return settingsPrefs.getBoolean(KEY_BIOMETRIC_AUTH_ENABLED, false)
     }
 
+    fun setBiometricFirstEnabled(enabled: Boolean) {
+        settingsPrefs.edit { putBoolean(KEY_BIOMETRIC_FIRST, enabled) }
+    }
+
+    /**
+     * When enabled (and biometrics are enabled), opening a locked app shows only the system
+     * biometric prompt over an opaque backdrop instead of the PIN/pattern/password screen.
+     * Cancelling the prompt leaves the app; "Use PIN" reveals the regular lock screen.
+     */
+    fun isBiometricFirstEnabled(): Boolean {
+        return settingsPrefs.getBoolean(KEY_BIOMETRIC_FIRST, false)
+    }
+
     fun setUseMaxBrightness(enabled: Boolean) {
         settingsPrefs.edit { putBoolean(KEY_USE_MAX_BRIGHTNESS, enabled) }
     }
@@ -177,6 +190,7 @@ class PreferencesRepository(context: Context) {
         private const val KEY_PASSWORD = "password"
         private const val KEY_PATTERN = "pattern"
         private const val KEY_BIOMETRIC_AUTH_ENABLED = "use_biometric_auth"
+        private const val KEY_BIOMETRIC_FIRST = "biometric_first"
         private const val KEY_DISABLE_HAPTICS = "disable_haptics"
         private const val KEY_USE_MAX_BRIGHTNESS = "use_max_brightness"
         private const val KEY_ANTI_UNINSTALL = "anti_uninstall"

@@ -65,6 +65,11 @@ class AppLockRepository(private val context: Context) {
 
     fun isBiometricAuthEnabled(): Boolean = preferencesRepository.isBiometricAuthEnabled()
 
+    fun setBiometricFirstEnabled(enabled: Boolean) =
+        preferencesRepository.setBiometricFirstEnabled(enabled)
+
+    fun isBiometricFirstEnabled(): Boolean = preferencesRepository.isBiometricFirstEnabled()
+
     fun setUseMaxBrightness(enabled: Boolean) = preferencesRepository.setUseMaxBrightness(enabled)
     fun shouldUseMaxBrightness(): Boolean = preferencesRepository.shouldUseMaxBrightness()
     fun setDisableHaptics(enabled: Boolean) = preferencesRepository.setDisableHaptics(enabled)

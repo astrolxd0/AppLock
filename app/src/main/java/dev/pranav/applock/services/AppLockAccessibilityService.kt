@@ -15,6 +15,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import dev.pranav.applock.core.broadcast.DeviceAdmin
 import dev.pranav.applock.core.utils.LogUtils
@@ -76,7 +77,7 @@ class AppLockAccessibilityService : AccessibilityService() {
 
             mainHandler = Handler(mainLooper)
 
-            overlayManager = LockScreenOverlayManager(this)
+            overlayManager = LockScreenOverlayManager.forAccessibilityService(this)
 
             val filter = android.content.IntentFilter().apply {
                 addAction(Intent.ACTION_SCREEN_OFF)
@@ -226,7 +227,8 @@ class AppLockAccessibilityService : AccessibilityService() {
         }
 
         // Skip excluded packages
-        if (packageName == APP_PACKAGE_PREFIX ||
+        if (packageName == this.packageName ||
+            packageName == APP_PACKAGE_PREFIX ||
             packageName in keyboardPackages ||
             packageName in EXCLUDED_APPS
         ) {
@@ -241,6 +243,10 @@ class AppLockAccessibilityService : AccessibilityService() {
         val currentForegroundPackage = packageName
         val triggeringPackage = lastForegroundPackage
         lastForegroundPackage = currentForegroundPackage
+
+        // User left the locked app (home, recents, another app): the lock screen must not
+        // stay on top of whatever is in front now.
+        overlayManager?.onForegroundPackageChanged(currentForegroundPackage)
 
         // Skip if triggering package is excluded
         if (triggeringPackage in appLockRepository.getTriggerExcludedApps()) {
@@ -332,45 +338,25 @@ class AppLockAccessibilityService : AccessibilityService() {
 
         LogUtils.d(TAG, "Showing overlay for: $packageName")
 
-        mainHandler.post {
-            AppLockManager.isLockScreenShown.set(true)
-            overlayManager?.showOverlay(
-                lockedPackageName = packageName,
-                triggeringPackageName = triggeringPackage,
-                onUnlock = {
-                    AppLockManager.isLockScreenShown.set(false)
-                    AppLockManager.unlockApp(packageName)
-                },
-                onExit = {
-                    performGlobalAction(GLOBAL_ACTION_HOME)
-                    Thread.sleep(200)
-                    AppLockManager.isLockScreenShown.set(false)
-                }
-            )
+        AppLockManager.isLockScreenShown.set(true)
+        val manager = overlayManager
+        if (manager == null) {
+            logError("Overlay manager not initialised, cannot show lock screen")
+            AppLockManager.isLockScreenShown.set(false)
+            return
         }
-    }
 
-    //private fun showLockScreenOverlay(packageName: String, triggeringPackage: String) {
-    //    LogUtils.d(TAG, "Locked app detected: $packageName. Showing overlay.")
-    //    AppLockManager.isLockScreenShown.set(true)
-    //
-    //    val intent = Intent(this, PasswordOverlayActivity::class.java).apply {
-    //        flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-    //                Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
-    //                Intent.FLAG_ACTIVITY_NO_ANIMATION or
-    //                Intent.FLAG_FROM_BACKGROUND or
-    //                Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-    //        putExtra("locked_package", packageName)
-    //        putExtra("triggering_package", triggeringPackage)
-    //    }
-    //
-    //    try {
-    //        startActivity(intent)
-    //    } catch (e: Exception) {
-    //        logError("Failed to start password overlay", e)
-    //        AppLockManager.isLockScreenShown.set(false)
-    //    }
-    //}
+        manager.showOverlay(
+            lockedPackageName = packageName,
+            triggeringPackageName = triggeringPackage,
+            onUnlock = {
+                AppLockManager.unlockApp(packageName)
+            },
+            onExit = {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
+        )
+    }
 
     private fun checkForDeviceAdminDeactivation(event: AccessibilityEvent) {
         Log.d(TAG, "Checking for device admin deactivation for event: $event")
@@ -523,12 +509,18 @@ class AppLockAccessibilityService : AccessibilityService() {
             when (appLockRepository.getBackendImplementation()) {
                 BackendImplementation.SHIZUKU -> {
                     Log.d(TAG, "Starting Shizuku service as primary backend")
-                    startService(Intent(this, ShizukuAppLockService::class.java))
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, ShizukuAppLockService::class.java)
+                    )
                 }
 
                 BackendImplementation.USAGE_STATS -> {
                     Log.d(TAG, "Starting Experimental service as primary backend")
-                    startService(Intent(this, UsageLockService::class.java))
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, UsageLockService::class.java)
+                    )
                 }
 
                 else -> {
@@ -570,7 +562,8 @@ class AppLockAccessibilityService : AccessibilityService() {
             isServiceRunning = false
             LogUtils.d(TAG, "Accessibility service destroyed")
 
-            overlayManager?.removeOverlay()
+            overlayManager?.destroy()
+            overlayManager = null
 
             try {
                 unregisterReceiver(screenStateReceiver)

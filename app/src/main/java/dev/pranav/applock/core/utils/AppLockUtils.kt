@@ -68,6 +68,22 @@ fun launchBatterySettings(context: Context) {
 }
 
 /**
+ * Sends the user to the launcher. Used when a lock screen is dismissed without unlocking so
+ * the locked app is pushed to the background instead of being revealed.
+ */
+fun Context.goHome() {
+    try {
+        val intent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        startActivity(intent)
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to launch home", e)
+    }
+}
+
+/**
  * Checks if the app has usage stats permission.
  */
 fun Context.hasUsagePermission(): Boolean {
