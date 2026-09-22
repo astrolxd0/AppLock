@@ -49,6 +49,11 @@ class UsageLockService: Service() {
     private var previousForegroundPackage = ""
     private var pauseMonitoring = false
 
+    // The monitor ticks every 250ms; don't ask InputMethodManager for the keyboard list each time.
+    // Refreshed on screen off so newly enabled keyboards are picked up.
+    @Volatile
+    private var cachedKeyboardPackages: List<String>? = null
+
     private val screenStateReceiver = object: android.content.BroadcastReceiver() {
         override fun onReceive(context: android.content.Context?, intent: Intent?) {
             if (intent?.action == Intent.ACTION_SCREEN_OFF) {
@@ -58,6 +63,7 @@ class UsageLockService: Service() {
                 )
                 AppLockManager.isLockScreenShown.set(false)
                 AppLockManager.clearTemporarilyUnlockedApp()
+                cachedKeyboardPackages = null
                 previousForegroundPackage = ""
                 pauseMonitoring = true
             } else if (intent?.action == Intent.ACTION_USER_PRESENT) {
@@ -144,7 +150,7 @@ class UsageLockService: Service() {
             val triggeringPackage = previousForegroundPackage
             previousForegroundPackage = currentPackage
 
-            Log.d(
+            LogUtils.d(
                 "Usage",
                 "cur: $currentPackage, prev: $triggeringPackage, unlocked ${
                     AppLockManager.isAppTemporarilyUnlocked(currentPackage)
@@ -169,10 +175,11 @@ class UsageLockService: Service() {
     }
 
     private fun isExclusionApp(packageName: String): Boolean {
-        val keyboardPackages = getSystemService<InputMethodManager>()
-            ?.enabledInputMethodList
-            ?.map { it.packageName }
-            ?: emptyList()
+        val keyboardPackages = cachedKeyboardPackages
+            ?: (getSystemService<InputMethodManager>()
+                ?.enabledInputMethodList
+                ?.map { it.packageName }
+                ?: emptyList()).also { cachedKeyboardPackages = it }
 
         return packageName == this.packageName ||
                 packageName in keyboardPackages ||
@@ -192,11 +199,6 @@ class UsageLockService: Service() {
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
 
-            Log.d(
-                TAG,
-                "${event.eventType} ${event.className} ${event.packageName} ${event.timeStamp} ${event.configuration} ${event.appStandbyBucket}"
-            )
-
             if (event.eventType != UsageEvents.Event.ACTIVITY_RESUMED && event.eventType != UsageEvents.Event.USER_INTERACTION) continue
 
             if (event.packageName == baseContext.packageName || event.className in AppLockConstants.KNOWN_RECENTS_CLASSES) {
@@ -210,7 +212,7 @@ class UsageLockService: Service() {
                 continue
             }
 
-            Log.d(TAG, "recent event ${event.eventType} ${event.className} ${event.packageName}")
+            LogUtils.d(TAG, "recent event ${event.eventType} ${event.className} ${event.packageName}")
 
             if (recentAppTime == event.timeStamp && recentApp?.first != null && appLockRepository.isAppLocked(
                     recentApp!!.first

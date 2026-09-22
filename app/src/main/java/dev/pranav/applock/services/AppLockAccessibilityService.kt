@@ -10,7 +10,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.util.LruCache
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.inputmethod.InputMethodManager
@@ -38,6 +40,12 @@ class AppLockAccessibilityService : AccessibilityService() {
     private var overlayManager: LockScreenOverlayManager? = null
     private lateinit var mainHandler: Handler
 
+    // Hot-path caches: accessibility events fire constantly, so avoid a PackageManager
+    // binder round-trip (or several) per event. Invalidated whenever the user unlocks the device.
+    @Volatile
+    private var cachedLauncherPackage: String? = null
+    private val appLabelCache = LruCache<String, CharSequence>(64)
+
     enum class BiometricState {
         IDLE, AUTH_STARTED
     }
@@ -46,6 +54,7 @@ class AppLockAccessibilityService : AccessibilityService() {
         private const val TAG = "AppLockAccessibility"
         private const val DEVICE_ADMIN_SETTINGS_PACKAGE = "com.android.settings"
         private const val APP_PACKAGE_PREFIX = "dev.pranav.applock"
+        private const val EXIT_SETTLE_DELAY_MS = 200L
 
         @Volatile
         var isServiceRunning = false
@@ -59,6 +68,9 @@ class AppLockAccessibilityService : AccessibilityService() {
                     AppLockManager.isLockScreenShown.set(false)
                     AppLockManager.clearTemporarilyUnlockedApp()
                     AppLockManager.appUnlockTimes.clear()
+                } else if (intent?.action == Intent.ACTION_USER_PRESENT) {
+                    cachedLauncherPackage = null
+                    appLabelCache.evictAll()
                 }
             } catch (e: Exception) {
                 logError("Error in screenStateReceiver", e)
@@ -134,10 +146,8 @@ class AppLockAccessibilityService : AccessibilityService() {
         }
 
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && event.text == packageManager.getApplicationInfo(
-                    event.packageName.toString(),
-                    0
-                ).loadLabel(packageManager)
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                event.text == getAppLabel(event.packageName.toString())
             ) {
                 Log.d(TAG, "Ignoring recents bug event: ${event.text}")
                 return
@@ -201,6 +211,17 @@ class AppLockAccessibilityService : AccessibilityService() {
                 event.packageName == getSystemDefaultLauncherPackageName()
     }
 
+    /**
+     * Cached app label lookup. Throws [PackageManager.NameNotFoundException] for unknown
+     * packages, just like the uncached call did, so event handling behaves the same.
+     */
+    private fun getAppLabel(packageName: String): CharSequence {
+        appLabelCache.get(packageName)?.let { return it }
+        val label = packageManager.getApplicationInfo(packageName, 0).loadLabel(packageManager)
+        appLabelCache.put(packageName, label)
+        return label
+    }
+
     private fun clearTemporarilyUnlockedAppIfNeeded(newPackage: String? = null) {
         val shouldClear = newPackage == null ||
                 (newPackage != AppLockManager.temporarilyUnlockedApp &&
@@ -242,8 +263,10 @@ class AppLockAccessibilityService : AccessibilityService() {
         val triggeringPackage = lastForegroundPackage
         lastForegroundPackage = currentForegroundPackage
 
+        val triggerExcludedApps = appLockRepository.getTriggerExcludedApps()
+
         // Skip if triggering package is excluded
-        if (triggeringPackage in appLockRepository.getTriggerExcludedApps()) {
+        if (triggeringPackage in triggerExcludedApps) {
             return
         }
 
@@ -251,7 +274,7 @@ class AppLockAccessibilityService : AccessibilityService() {
         val unlockedApp = AppLockManager.temporarilyUnlockedApp
         if (unlockedApp.isNotEmpty() &&
             unlockedApp != currentForegroundPackage &&
-            currentForegroundPackage !in appLockRepository.getTriggerExcludedApps()
+            currentForegroundPackage !in triggerExcludedApps
         ) {
             LogUtils.d(
                 TAG,
@@ -332,7 +355,7 @@ class AppLockAccessibilityService : AccessibilityService() {
 
         LogUtils.d(TAG, "Showing overlay for: $packageName")
 
-        mainHandler.post {
+        val show = {
             AppLockManager.isLockScreenShown.set(true)
             overlayManager?.showOverlay(
                 lockedPackageName = packageName,
@@ -343,10 +366,34 @@ class AppLockAccessibilityService : AccessibilityService() {
                 },
                 onExit = {
                     performGlobalAction(GLOBAL_ACTION_HOME)
-                    Thread.sleep(200)
-                    AppLockManager.isLockScreenShown.set(false)
+                    // Keep the lock flag set while the home transition settles, without
+                    // blocking the main thread (a sleep here froze the UI on every dismiss).
+                    mainHandler.postDelayed({
+                        AppLockManager.isLockScreenShown.set(false)
+                        recheckForegroundAfterExit()
+                    }, EXIT_SETTLE_DELAY_MS)
                 }
             )
+        }
+
+        // Accessibility events are delivered on the main thread, so show the overlay right away
+        // instead of waiting for another trip through the message queue.
+        if (Looper.myLooper() == mainLooper) show() else mainHandler.post { show() }
+    }
+
+    /**
+     * Events that arrive while the exit transition settles are skipped because the lock flag is
+     * still set. Re-evaluate whatever is in the foreground now so a locked app opened during that
+     * window (or one the home action failed to leave) still gets locked.
+     */
+    private fun recheckForegroundAfterExit() {
+        try {
+            val current = lastForegroundPackage
+            if (current.isEmpty() || !appLockRepository.isProtectEnabled()) return
+            if (!isValidPackageForLocking(current)) return
+            checkAndLockApp(current, "", System.currentTimeMillis())
+        } catch (e: Exception) {
+            logError("Error re-checking foreground app after exit", e)
         }
     }
 
@@ -486,6 +533,11 @@ class AppLockAccessibilityService : AccessibilityService() {
     }
 
     fun getSystemDefaultLauncherPackageName(): String {
+        cachedLauncherPackage?.let { return it }
+        return queryDefaultLauncherPackageName().also { cachedLauncherPackage = it }
+    }
+
+    private fun queryDefaultLauncherPackageName(): String {
         return try {
             val packageManager = packageManager
             val homeIntent = Intent(Intent.ACTION_MAIN).apply {

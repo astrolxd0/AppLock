@@ -41,7 +41,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
@@ -49,6 +48,7 @@ import dev.pranav.applock.R
 import dev.pranav.applock.core.ui.shapes
 import dev.pranav.applock.core.utils.appLockRepository
 import dev.pranav.applock.core.utils.vibrate
+import dev.pranav.applock.core.utils.vibrateKeyTap
 import dev.pranav.applock.data.repository.AppLockRepository
 import dev.pranav.applock.data.repository.PreferencesRepository
 import dev.pranav.applock.services.AppLockManager
@@ -777,7 +777,7 @@ fun KeypadSection(
         }
     }
 
-    val disableHaptics = context.appLockRepository().shouldDisableHaptics()
+    val disableHaptics = remember(context) { context.appLockRepository().shouldDisableHaptics() }
 
     val onSpecialKeyClick = remember(
         passwordState,
@@ -973,19 +973,17 @@ fun KeypadRow(
                 label = "ButtonContainerColorAnimation"
             )
 
-            val normalTextSize = MaterialTheme.typography.headlineLargeEmphasized.fontSize
-
-            val targetFontSize = if (isPressed) normalTextSize * 1.2f else normalTextSize
-
-            val animatedFontSize by animateFloatAsState(
-                targetValue = targetFontSize.value,
+            // Animate a draw-time scale rather than the font size: changing fontSize re-measures
+            // and re-lays out the text on every animation frame.
+            val animatedTextScale by animateFloatAsState(
+                targetValue = if (isPressed) 1.2f else 1f,
                 animationSpec = tween(durationMillis = 100),
-                label = "ButtonTextSizeAnimation"
+                label = "ButtonTextScaleAnimation"
             )
 
             FilledTonalButton(
                 onClick = {
-                    if (!disableHaptics) vibrate(context, 100)
+                    if (!disableHaptics) vibrateKeyTap(context)
                     onKeyClick(key)
                 },
                 modifier = Modifier.size(buttonSize),
@@ -1011,9 +1009,11 @@ fun KeypadRow(
                 } else {
                     Text(
                         text = key,
-                        style = MaterialTheme.typography.headlineLargeEmphasized.copy(
-                            fontSize = animatedFontSize.sp
-                        ),
+                        style = MaterialTheme.typography.headlineLargeEmphasized,
+                        modifier = Modifier.graphicsLayer {
+                            scaleX = animatedTextScale
+                            scaleY = animatedTextScale
+                        }
                     )
                 }
             }

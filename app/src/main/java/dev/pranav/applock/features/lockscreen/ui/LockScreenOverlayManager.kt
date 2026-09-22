@@ -66,6 +66,18 @@ class LockScreenOverlayManager(private val context: Context):
             isStateRestored = true
         }
 
+        // Read everything the lock screen needs up front instead of inside the composition,
+        // so the first frame isn't waiting on PackageManager / prefs lookups.
+        val appLockRepository = context.appLockRepository()
+        val lockType = appLockRepository.getLockType()
+        val showBiometricButton = appLockRepository.isBiometricAuthEnabled()
+        val appName = try {
+            val pm = context.packageManager
+            pm.getApplicationLabel(pm.getApplicationInfo(lockedPackageName, 0)).toString()
+        } catch (_: Exception) {
+            "App"
+        }
+
         composeView = ComposeView(context).apply {
             setViewTreeLifecycleOwner(this@LockScreenOverlayManager)
             setViewTreeSavedStateRegistryOwner(this@LockScreenOverlayManager)
@@ -80,15 +92,6 @@ class LockScreenOverlayManager(private val context: Context):
                             modifier = Modifier.fillMaxSize(),
                             color = MaterialTheme.colorScheme.background
                         ) {
-                            val appLockRepository = context.appLockRepository()
-                            val appName = try {
-                                val pm = context.packageManager
-                                pm.getApplicationLabel(pm.getApplicationInfo(lockedPackageName, 0))
-                                    .toString()
-                            } catch (_: Exception) {
-                                "App"
-                            }
-
                             val onPinAttemptCallback = { pin: String ->
                                 val isValid = appLockRepository.validatePassword(pin)
                                 if (isValid) {
@@ -111,8 +114,6 @@ class LockScreenOverlayManager(private val context: Context):
                                 onExit()
                                 removeOverlay()
                             }
-
-                            val lockType = appLockRepository.getLockType()
 
                             when (lockType) {
                                 PreferencesRepository.LOCK_TYPE_PATTERN -> {
@@ -144,7 +145,7 @@ class LockScreenOverlayManager(private val context: Context):
 
                                 PreferencesRepository.LOCK_TYPE_PASSWORD -> {
                                     AlphanumericPasswordOverlayScreen(
-                                        showBiometricButton = appLockRepository.isBiometricAuthEnabled(),
+                                        showBiometricButton = showBiometricButton,
                                         fromMainActivity = false,
                                         showCloseButton = true,
                                         onClose = {
@@ -176,7 +177,7 @@ class LockScreenOverlayManager(private val context: Context):
 
                                 else -> {
                                     PinPasswordOverlayScreen(
-                                        showBiometricButton = appLockRepository.isBiometricAuthEnabled(),
+                                        showBiometricButton = showBiometricButton,
                                         fromMainActivity = false,
                                         showCloseButton = true,
                                         onClose = {
@@ -224,7 +225,7 @@ class LockScreenOverlayManager(private val context: Context):
             PixelFormat.TRANSLUCENT
         ).apply {
             // Respect brightness setting
-            if (context.appLockRepository().shouldUseMaxBrightness()) {
+            if (appLockRepository.shouldUseMaxBrightness()) {
                 screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_FULL
             }
         }

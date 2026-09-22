@@ -30,6 +30,23 @@ fun vibrate(context: Context, duration: Long = DEFAULT_VIBRATION_DURATION) {
     }
 }
 
+/**
+ * Short, crisp haptic tick for key presses. A 100ms buzz per tap feels sluggish, so use the
+ * system's predefined click effect where available.
+ */
+fun vibrateKeyTap(context: Context) {
+    try {
+        val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)
+        } else {
+            VibrationEffect.createOneShot(KEY_TAP_VIBRATION_DURATION, VibrationEffect.DEFAULT_AMPLITUDE)
+        }
+        getVibrator(context).vibrate(effect)
+    } catch (e: Exception) {
+        Log.w(TAG, "Failed to vibrate device", e)
+    }
+}
+
 private fun getVibrator(context: Context): Vibrator {
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         val vibratorManager =
@@ -109,6 +126,7 @@ private fun showBatteryOptimizationToast(context: Context, message: String) {
 
 private const val TAG = "AppLockUtils"
 private const val DEFAULT_VIBRATION_DURATION = 500L
+private const val KEY_TAP_VIBRATION_DURATION = 20L
 
 /**
  * Extension function to get AppLockRepository from Context
