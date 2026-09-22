@@ -146,6 +146,21 @@ class ShizukuActivityManager(
         val visibleTasks = getVisibleTasks()
         if (visibleTasks.isEmpty()) return
 
+        // "Leaving" an app means it is no longer on screen, not merely losing focus. In
+        // split-screen or pop-up view the other pane / the launcher takes focus on every touch
+        // while the unlocked app stays fully visible; re-locking there is just noise. Once the
+        // app has actually gone (home, recents, another fullscreen app) the unlock is dropped
+        // so the next launch asks again. Our own lock-screen activities do not count.
+        val visiblePackages = visibleTasks.mapNotNull { it.topActivity?.packageName }.toSet()
+        val unlockedApp = AppLockManager.temporarilyUnlockedApp
+        if (unlockedApp.isNotEmpty() &&
+            unlockedApp !in visiblePackages &&
+            context.packageName !in visiblePackages
+        ) {
+            LogUtils.d(TAG, "Unlocked app $unlockedApp left the screen, re-arming its lock")
+            AppLockManager.clearTemporarilyUnlockedApp()
+        }
+
         // In split-screen / freeform more than one task is visible. A locked app that is
         // on screen must be locked even if the other pane currently has focus, so prefer any
         // visible locked-and-not-unlocked task over the merely focused one.
@@ -163,8 +178,9 @@ class ShizukuActivityManager(
         // Skip our own app (lock screen fallback activity etc.)
         if (packageName == context.packageName) return
 
-        // Skip if app is temporarily unlocked and still in front
-        if (packageName == lastForegroundApp && AppLockManager.isAppTemporarilyUnlocked(packageName)) {
+        // Skip if the app is temporarily unlocked (it is still on screen, see above)
+        if (AppLockManager.isAppTemporarilyUnlocked(packageName)) {
+            lastForegroundApp = packageName
             return
         }
 
