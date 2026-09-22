@@ -2,15 +2,14 @@ package dev.pranav.applock.features.lockscreen.ui
 
 import android.os.Bundle
 import android.util.Log
+import android.view.ViewTreeObserver
 import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.toBitmap
 import androidx.fragment.app.FragmentActivity
 import dev.pranav.applock.R
 import dev.pranav.applock.services.AppLockManager
@@ -44,11 +43,19 @@ class TransparentBiometricActivity : FragmentActivity() {
         @Volatile
         var resultListener: ((success: Boolean, errorCode: Int) -> Unit)? = null
 
+        /**
+         * Invoked once the activity has drawn its first frame. The lock overlay waits for this
+         * before hiding itself so the locked app never peeks through in between.
+         */
+        @Volatile
+        var onShownListener: (() -> Unit)? = null
+
         private var current: WeakReference<TransparentBiometricActivity>? = null
 
         /** Closes the currently showing instance, if any, without reporting a result. */
         fun cancelCurrent() {
             resultListener = null
+            onShownListener = null
             current?.get()?.let {
                 if (!it.isFinishing) it.finish()
             }
@@ -64,14 +71,30 @@ class TransparentBiometricActivity : FragmentActivity() {
 
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
 
-        setContent {
-            AppLockTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.surfaceContainer
-                ) {}
+        // Same visuals as the overlay's biometric backdrop so the hand-off is seamless.
+        val appIcon = lockedPackageName?.let { pkg ->
+            try {
+                packageManager.getApplicationIcon(pkg).toBitmap().asImageBitmap()
+            } catch (_: Exception) {
+                null
             }
         }
+
+        setContent {
+            AppLockTheme {
+                BiometricBackdropScreen(
+                    appName = appName,
+                    appIcon = appIcon,
+                    statusText = null,
+                    promptActive = true,
+                    onRetry = {},
+                    onUseCredential = {},
+                    onClose = {}
+                )
+            }
+        }
+
+        notifyShownAfterFirstDraw()
 
         AppLockManager.reportBiometricAuthStarted()
 
@@ -118,6 +141,26 @@ class TransparentBiometricActivity : FragmentActivity() {
             deliver(false, ERROR_FAILED_TO_START)
             finish()
         }
+    }
+
+    private fun notifyShownAfterFirstDraw() {
+        val decor = window.decorView
+        val observer = decor.viewTreeObserver
+        val listener = object : ViewTreeObserver.OnDrawListener {
+            override fun onDraw() {
+                // Cannot remove a draw listener from within onDraw; do it on the next message.
+                decor.post {
+                    try {
+                        decor.viewTreeObserver.removeOnDrawListener(this)
+                    } catch (_: Exception) {
+                    }
+                    val shown = onShownListener
+                    onShownListener = null
+                    shown?.invoke()
+                }
+            }
+        }
+        observer.addOnDrawListener(listener)
     }
 
     /** Hands the result to the registered listener. Returns false if there was none. */

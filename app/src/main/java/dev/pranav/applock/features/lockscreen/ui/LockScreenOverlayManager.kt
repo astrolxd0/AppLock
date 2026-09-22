@@ -73,7 +73,7 @@ class LockScreenOverlayManager private constructor(
 
     companion object {
         private const val TAG = "LockScreenOverlay"
-        private const val AUTO_PROMPT_DELAY_MS = 250L
+        private const val AUTO_PROMPT_DELAY_MS = 50L
         private const val PROMPT_RETRY_DELAY_MS = 600L
         private const val MAX_PROMPT_RETRIES = 2
 
@@ -618,10 +618,18 @@ class LockScreenOverlayManager private constructor(
         if (userInitiated) promptRetries = 0
         biometricStatus = null
 
-        // The activity sits below any overlay window, so ours must get out of the way.
-        removeShield()
-        rootView?.visibility = View.INVISIBLE
         promptActive = true
+
+        // The activity sits below any overlay window, so ours has to get out of the way,
+        // but only once the activity has drawn. Hiding earlier lets the app flash through.
+        TransparentBiometricActivity.onShownListener = {
+            runOnMain {
+                if (promptActive && isShowing && lockedPackageName == packageName) {
+                    removeShield()
+                    rootView?.visibility = View.INVISIBLE
+                }
+            }
+        }
 
         TransparentBiometricActivity.resultListener = { success, errorCode ->
             runOnMain {
@@ -661,6 +669,7 @@ class LockScreenOverlayManager private constructor(
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start biometric activity", e)
             TransparentBiometricActivity.resultListener = null
+            TransparentBiometricActivity.onShownListener = null
             promptActive = false
             restoreWindowsAfterPrompt()
             if (uiMode == LockUiMode.BIOMETRIC_ONLY) uiMode = LockUiMode.CREDENTIAL_ENTRY
