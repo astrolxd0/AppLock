@@ -547,7 +547,13 @@ class LockScreenOverlayManager private constructor(
         if (shieldView == null && canDrawOverlays(hostContext)) {
             attachShield()
         }
-        rootView?.visibility = View.INVISIBLE
+        // Never expose the app: the lock view only steps aside when the opaque shield is
+        // actually in place to take over covering and touch-blocking.
+        if (shieldView != null) {
+            rootView?.visibility = View.INVISIBLE
+        } else {
+            Log.w(TAG, "No overlay permission for shield; keeping accessibility lock view visible")
+        }
     }
 
     private fun restoreWindowsAfterPrompt() {
@@ -620,13 +626,16 @@ class LockScreenOverlayManager private constructor(
 
         promptActive = true
 
-        // The activity sits below any overlay window, so ours has to get out of the way,
-        // but only once the activity has drawn. Hiding earlier lets the app flash through.
+        // The activity only has to exist as the top task so the system does not cancel the
+        // prompt; the prompt UI itself is a system window drawn above an application overlay.
+        // So the lock window stays exactly where it is, covering and touch-blocking the app
+        // (which matters in pop-up / freeform view, where the app floats above any activity
+        // we start). An accessibility overlay is layered above the prompt, so for that case
+        // the opaque shield replaces it once the activity has drawn.
         TransparentBiometricActivity.onShownListener = {
             runOnMain {
                 if (promptActive && isShowing && lockedPackageName == packageName) {
-                    removeShield()
-                    rootView?.visibility = View.INVISIBLE
+                    prepareWindowsForPrompt()
                 }
             }
         }
