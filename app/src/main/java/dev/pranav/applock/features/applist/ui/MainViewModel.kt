@@ -29,12 +29,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _debouncedQuery = MutableStateFlow("")
 
+    // _allApps is already sorted by label, so these only need to filter. Run it off the main
+    // thread: it used to re-load and sort every label on Main whenever anything changed.
     val lockedAppsFlow: StateFlow<List<ApplicationInfo>> =
         combine(_allApps, _lockedApps, _debouncedQuery) { apps, locked, query ->
-            apps.filter { it.packageName in locked }
-                .filter { it.matchesQuery(query) }
-                .sortedBy { it.loadLabel(getApplication<Application>().packageManager).toString() }
-        }.stateIn(
+            apps.filter { it.packageName in locked && it.matchesQuery(query) }
+        }.flowOn(Dispatchers.Default).stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000L),
             initialValue = emptyList()
@@ -42,10 +42,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val unlockedAppsFlow: StateFlow<List<ApplicationInfo>> =
         combine(_allApps, _lockedApps, _debouncedQuery) { apps, locked, query ->
-            apps.filterNot { it.packageName in locked }
-                .filter { it.matchesQuery(query) }
-                .sortedBy { it.loadLabel(getApplication<Application>().packageManager).toString() }
-        }.stateIn(
+            apps.filter { it.packageName !in locked && it.matchesQuery(query) }
+        }.flowOn(Dispatchers.Default).stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000L),
             initialValue = emptyList()
@@ -53,8 +51,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun ApplicationInfo.matchesQuery(query: String): Boolean {
         if (query.isBlank()) return true
-        return loadLabel(getApplication<Application>().packageManager).toString()
-            .contains(query, ignoreCase = true)
+        return AppIconCache.getLabel(getApplication(), this).contains(query, ignoreCase = true)
     }
 
     init {

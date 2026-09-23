@@ -21,6 +21,11 @@ object AppLockConstants {
         "com.android.systemui",
         "com.android.intentresolver",
         "com.google.android.permissioncontroller",
+        "com.android.permissioncontroller",
+        "com.android.packageinstaller",
+        "com.google.android.packageinstaller",
+        // Samsung One UI hosts the biometric prompt UI in its own package
+        "com.samsung.android.biometrics.app.setting",
         "android.uid.system:1000",
         "com.google.android.googlequicksearchbox",
         "android",

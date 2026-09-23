@@ -30,6 +30,23 @@ fun vibrate(context: Context, duration: Long = DEFAULT_VIBRATION_DURATION) {
     }
 }
 
+/**
+ * Short, crisp haptic tick for key presses. A 100ms buzz per tap feels sluggish, so use the
+ * system's predefined click effect where available.
+ */
+fun vibrateKeyTap(context: Context) {
+    try {
+        val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)
+        } else {
+            VibrationEffect.createOneShot(KEY_TAP_VIBRATION_DURATION, VibrationEffect.DEFAULT_AMPLITUDE)
+        }
+        getVibrator(context).vibrate(effect)
+    } catch (e: Exception) {
+        Log.w(TAG, "Failed to vibrate device", e)
+    }
+}
+
 private fun getVibrator(context: Context): Vibrator {
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         val vibratorManager =
@@ -64,6 +81,22 @@ fun launchBatterySettings(context: Context) {
     } catch (e: Exception) {
         Log.e(TAG, "Failed to launch battery settings", e)
         showBatteryOptimizationToast(context, "Failed to open battery settings")
+    }
+}
+
+/**
+ * Sends the user to the launcher. Used when a lock screen is dismissed without unlocking so
+ * the locked app is pushed to the background instead of being revealed.
+ */
+fun Context.goHome() {
+    try {
+        val intent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        startActivity(intent)
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to launch home", e)
     }
 }
 
@@ -109,6 +142,7 @@ private fun showBatteryOptimizationToast(context: Context, message: String) {
 
 private const val TAG = "AppLockUtils"
 private const val DEFAULT_VIBRATION_DURATION = 500L
+private const val KEY_TAP_VIBRATION_DURATION = 20L
 
 /**
  * Extension function to get AppLockRepository from Context

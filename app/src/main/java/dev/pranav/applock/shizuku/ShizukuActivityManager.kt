@@ -3,8 +3,12 @@ package dev.pranav.applock.shizuku
 import android.app.ActivityManager
 import android.app.IActivityTaskManager
 import android.app.TaskInfo
-import android.content.*
+import android.content.BroadcastReceiver
+import android.content.ComponentName
+import android.content.Context
 import android.content.Context.RECEIVER_EXPORTED
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
@@ -12,6 +16,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.Display
 import android.view.IWindowManager
+import androidx.annotation.RequiresApi
 import dev.pranav.applock.core.broadcast.DeviceUnlockReceiver
 import dev.pranav.applock.core.utils.LogUtils
 import dev.pranav.applock.data.repository.AppLockRepository
@@ -32,18 +37,20 @@ class ShizukuActivityManager(
     private var lastForegroundApp = ""
     private var deviceUnlockReceiver: DeviceUnlockReceiver? = null
     private var shouldLockAppsOnReturn = false
+    private var receiversRegistered = false
+    private var running = false
 
     private val handler = Handler(Looper.getMainLooper())
     private val checkForegroundRunnable = object : Runnable {
         override fun run() {
+            if (!running) return
             try {
                 checkForegroundApp()
             } catch (e: Exception) {
-                e.printStackTrace()
                 LogUtils.e(TAG, "Unhandled exception in foreground monitor", e)
             } finally {
-                // Schedule itself again after 500ms regardless of failure
-                handler.postDelayed(this, 500)
+                // Schedule itself again regardless of failure
+                if (running) handler.postDelayed(this, POLL_INTERVAL_MS)
             }
         }
     }
@@ -82,12 +89,14 @@ class ShizukuActivityManager(
             startForegroundAppMonitoring()
             return true
         } catch (e: Exception) {
-            e.printStackTrace()
+            LogUtils.e(TAG, "Failed to start Shizuku monitoring", e)
             return false
         }
     }
 
     private fun registerEventReceivers() {
+        if (receiversRegistered) return
+
         val homeFilter = IntentFilter().apply {
             addAction(Intent.ACTION_CLOSE_SYSTEM_DIALOGS)
             addAction(Intent.ACTION_SCREEN_OFF)
@@ -104,6 +113,7 @@ class ShizukuActivityManager(
             shouldLockAppsOnReturn = true
         }
         context.registerReceiver(deviceUnlockReceiver, unlockFilter)
+        receiversRegistered = true
     }
 
     val windowManager: IWindowManager
@@ -112,6 +122,7 @@ class ShizukuActivityManager(
             .let(IWindowManager.Stub::asInterface)
 
     private fun startForegroundAppMonitoring() {
+        running = true
         handler.removeCallbacks(checkForegroundRunnable)
         handler.post(checkForegroundRunnable)
         Log.d(TAG, "Foreground app monitoring started")
@@ -120,6 +131,7 @@ class ShizukuActivityManager(
     private fun checkForegroundApp() {
         if (!appLockRepository.isProtectEnabled()) return
         if (appLockRepository.getBackendImplementation() != BackendImplementation.SHIZUKU) {
+            running = false
             handler.removeCallbacks(checkForegroundRunnable)
             return
         }
@@ -131,82 +143,111 @@ class ShizukuActivityManager(
 
         if (context.isDeviceLocked()) return
 
-        getTasksWrapper().filterVisible().forEach {
-            val activity = it.topActivity!!
-            val packageName = activity.packageName
-            val className = activity.className
+        val visibleTasks = getVisibleTasks()
+        if (visibleTasks.isEmpty()) return
 
-            // Skip our own app and known recents classes
-            if (packageName == context.packageName) return
+        // "Leaving" an app means it is no longer on screen, not merely losing focus. In
+        // split-screen or pop-up view the other pane / the launcher takes focus on every touch
+        // while the unlocked app stays fully visible; re-locking there is just noise. Once the
+        // app has actually gone (home, recents, another fullscreen app) the unlock is dropped
+        // so the next launch asks again. Our own lock-screen activities do not count.
+        val visiblePackages = visibleTasks.mapNotNull { it.topActivity?.packageName }.toSet()
+        val unlockedApp = AppLockManager.temporarilyUnlockedApp
+        if (unlockedApp.isNotEmpty() &&
+            unlockedApp !in visiblePackages &&
+            context.packageName !in visiblePackages
+        ) {
+            LogUtils.d(TAG, "Unlocked app $unlockedApp left the screen, re-arming its lock")
+            AppLockManager.clearTemporarilyUnlockedApp()
+        }
 
-            // Skip if app is temporarily unlocked
-            if (packageName == lastForegroundApp && AppLockManager.isAppTemporarilyUnlocked(
-                    packageName
-                )
-            ) return
+        // In split-screen / freeform more than one task is visible. A locked app that is
+        // on screen must be locked even if the other pane currently has focus, so prefer any
+        // visible locked-and-not-unlocked task over the merely focused one.
+        val lockedApps = appLockRepository.getLockedApps()
+        val task = visibleTasks.firstOrNull { info ->
+            val pkg = info.topActivity?.packageName ?: return@firstOrNull false
+            pkg in lockedApps && !AppLockManager.isAppTemporarilyUnlocked(pkg) &&
+                    !AppLockManager.appUnlockTimes.containsKey(pkg)
+        } ?: visibleTasks.first()
 
-            // If we should lock apps on return (home button pressed, device locked, etc.)
-            // then trigger app lock for any new foreground app
-            if (shouldLockAppsOnReturn && packageName != lastForegroundApp) {
-                LogUtils.d(TAG, "Should lock apps on return - triggering for: $packageName")
-                shouldLockAppsOnReturn = false // Reset the flag
+        val activity = task.topActivity ?: return
+        val packageName = activity.packageName
+        val className = activity.className
 
-                val timeMillis = System.currentTimeMillis()
-                lastForegroundApp = packageName
-                onForegroundAppChanged(packageName, className, timeMillis)
-                return
-            }
+        // Skip our own app (lock screen fallback activity etc.)
+        if (packageName == context.packageName) return
 
-            // Normal app switching - only trigger if current app has changed
-            if (packageName != lastForegroundApp) {
-                val triggerExclusions = appLockRepository.getTriggerExcludedApps()
+        // Skip if the app is temporarily unlocked (it is still on screen, see above)
+        if (AppLockManager.isAppTemporarilyUnlocked(packageName)) {
+            lastForegroundApp = packageName
+            return
+        }
 
-                // Check if previous app was in trigger exclusions
-                if (lastForegroundApp in triggerExclusions) {
-                    LogUtils.d(
-                        TAG,
-                        "Previous app $lastForegroundApp is excluded, skipping app lock for $packageName"
-                    )
-                    lastForegroundApp = packageName
-                    return
-                }
-            }
-
-            val timeMillis = System.currentTimeMillis()
-            LogUtils.d(TAG, "Foreground app changed to: $packageName, class: $className")
+        // If we should lock apps on return (home button pressed, device locked, etc.)
+        // then trigger app lock for any new foreground app
+        if (shouldLockAppsOnReturn && packageName != lastForegroundApp) {
+            LogUtils.d(TAG, "Should lock apps on return - triggering for: $packageName")
+            shouldLockAppsOnReturn = false // Reset the flag
 
             lastForegroundApp = packageName
-            onForegroundAppChanged(packageName, className, timeMillis)
+            onForegroundAppChanged(packageName, className, System.currentTimeMillis())
+            return
         }
+
+        // Normal app switching - check whether the previous app is a trigger exclusion
+        if (packageName != lastForegroundApp) {
+            val triggerExclusions = appLockRepository.getTriggerExcludedApps()
+
+            if (lastForegroundApp in triggerExclusions) {
+                LogUtils.d(
+                    TAG,
+                    "Previous app $lastForegroundApp is excluded, skipping app lock for $packageName"
+                )
+                lastForegroundApp = packageName
+                return
+            }
+            LogUtils.d(TAG, "Foreground app changed to: $packageName, class: $className")
+        }
+
+        lastForegroundApp = packageName
+        onForegroundAppChanged(packageName, className, System.currentTimeMillis())
     }
 
     fun stop() {
-        homeButtonReceiver.let { receiver ->
+        running = false
+        handler.removeCallbacks(checkForegroundRunnable)
+
+        if (receiversRegistered) {
             try {
-                context.unregisterReceiver(receiver)
+                context.unregisterReceiver(homeButtonReceiver)
                 Log.d(TAG, "Home button receiver unregistered")
             } catch (e: Exception) {
                 Log.e(TAG, "Error unregistering home button receiver", e)
             }
-        }
 
-        deviceUnlockReceiver?.let { receiver ->
-            try {
-                context.unregisterReceiver(receiver)
-                deviceUnlockReceiver = null
-                Log.d(TAG, "Device unlock receiver unregistered")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error unregistering device unlock receiver", e)
+            deviceUnlockReceiver?.let { receiver ->
+                try {
+                    context.unregisterReceiver(receiver)
+                    Log.d(TAG, "Device unlock receiver unregistered")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error unregistering device unlock receiver", e)
+                }
             }
+            deviceUnlockReceiver = null
+            receiversRegistered = false
         }
 
-        handler.removeCallbacks(checkForegroundRunnable)
         Log.d(TAG, "ShizukuActivityManager stopped")
+    }
+
+    companion object {
+        private const val POLL_INTERVAL_MS = 400L
     }
 }
 
 val topActivity: ComponentName?
-    get() = getTasksWrapper().firstOrNull()?.topActivity
+    get() = getVisibleTasks().firstOrNull()?.topActivity
 
 private val activityTaskManager: IActivityTaskManager by lazy {
     SystemServiceHelper.getSystemService("activity_task")
@@ -214,37 +255,92 @@ private val activityTaskManager: IActivityTaskManager by lazy {
         .let(IActivityTaskManager.Stub::asInterface)
 }
 
-private fun getTasksWrapper(): List<ActivityManager.RunningTaskInfo> = when {
-    Build.VERSION.SDK_INT < 31 -> runCatching { activityTaskManager.getTasks(8) }.getOrNull()
-        .orEmpty()
+/**
+ * Which `IActivityTaskManager.getTasks` overload this device has. The signature changed in
+ * Android 12 and again mid-Android 13, so the wrong one throws [NoSuchMethodError]. Remembered
+ * after the first successful call.
+ */
+@Volatile
+private var getTasksVariant = -1
 
-    else -> runCatching { activityTaskManager.getTasks(8, false, false, Display.INVALID_DISPLAY) }
-        .getOrNull()
-        .orEmpty()
-}
+private fun getTasksWrapper(): List<ActivityManager.RunningTaskInfo> {
+    val attempts: List<() -> List<ActivityManager.RunningTaskInfo>?> = listOf(
+        { activityTaskManager.getTasks(MAX_TASKS, false, false, Display.INVALID_DISPLAY) },
+        { activityTaskManager.getTasks(MAX_TASKS, false, false) },
+        { activityTaskManager.getTasks(MAX_TASKS) }
+    )
 
-private fun List<ActivityManager.RunningTaskInfo>.filterVisible(): List<ActivityManager.RunningTaskInfo> {
-    return filter {
-        it.isRunning && it.isVisible
+    val order = if (getTasksVariant >= 0) listOf(getTasksVariant) else attempts.indices.toList()
+
+    for (index in order) {
+        try {
+            val result = attempts[index]() ?: emptyList()
+            getTasksVariant = index
+            return result
+        } catch (_: NoSuchMethodError) {
+            // Try the next signature
+        } catch (_: AbstractMethodError) {
+            // Try the next signature
+        } catch (e: Throwable) {
+            Log.e("ShizukuActivityManager", "getTasks failed", e)
+            return emptyList()
+        }
     }
+    Log.e("ShizukuActivityManager", "No compatible IActivityTaskManager.getTasks signature found")
+    return emptyList()
 }
 
+private const val MAX_TASKS = 8
+
+/**
+ * The tasks currently on screen, focused task first and then in z-order. Before Android 12
+ * the visibility fields do not exist, so only the most recent task is returned.
+ */
+private fun getVisibleTasks(): List<ActivityManager.RunningTaskInfo> {
+    val tasks = getTasksWrapper()
+    if (tasks.isEmpty()) return emptyList()
+
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+        return listOfNotNull(tasks.firstOrNull { it.topActivity != null })
+    }
+
+    val visible = tasks.filter { it.topActivity != null && it.isRunningCompat() && it.isVisibleCompat() }
+    if (visible.isEmpty()) return emptyList()
+
+    val focused = visible.firstOrNull { it.isFocused() } ?: return visible
+    return listOf(focused) + visible.filter { it !== focused }
+}
+
+@RequiresApi(Build.VERSION_CODES.S)
+private fun TaskInfo.isRunningCompat(): Boolean = try {
+    isRunning
+} catch (_: Throwable) {
+    true
+}
+
+@RequiresApi(Build.VERSION_CODES.S)
+private fun TaskInfo.isVisibleCompat(): Boolean = try {
+    isVisible
+} catch (_: Throwable) {
+    true
+}
+
+@RequiresApi(Build.VERSION_CODES.Q)
 fun TaskInfo.isFreeform(): Boolean {
     try {
         return HiddenApiBypass.invoke(TaskInfo::class.java, this, "isFreeform") as Boolean
     } catch (e: Throwable) {
-        e.printStackTrace()
         return false
     }
 }
 
+@RequiresApi(Build.VERSION_CODES.Q)
 fun TaskInfo.isFocused(): Boolean {
     try {
         return HiddenApiBypass.getInstanceFields(TaskInfo::class.java)
-            .firstOrNull { it.name == "isFocused" }!!
-            .getBoolean(this)
+            .firstOrNull { it.name == "isFocused" }
+            ?.getBoolean(this) ?: false
     } catch (e: Throwable) {
-        e.printStackTrace()
         return false
     }
 }

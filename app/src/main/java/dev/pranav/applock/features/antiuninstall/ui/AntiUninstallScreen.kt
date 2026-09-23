@@ -533,7 +533,7 @@ private fun AppProtectionItem(app: AppInfo, isProtected: Boolean, onToggle: () -
             verticalAlignment = Alignment.CenterVertically
         ) {
             Image(
-                bitmap = app.icon.toBitmap(96, 96).asImageBitmap(),
+                bitmap = remember(app.packageName) { app.icon.toBitmap(96, 96).asImageBitmap() },
                 contentDescription = null,
                 modifier = Modifier.size(48.dp)
             )

@@ -86,6 +86,7 @@ fun SettingsScreen(
     var autoUnlock by remember { mutableStateOf(appLockRepository.isAutoUnlockEnabled()) }
     var useMaxBrightness by remember { mutableStateOf(appLockRepository.shouldUseMaxBrightness()) }
     var useBiometricAuth by remember { mutableStateOf(appLockRepository.isBiometricAuthEnabled()) }
+    var biometricFirst by remember { mutableStateOf(appLockRepository.isBiometricFirstEnabled()) }
     var unlockTimeDuration by remember { mutableIntStateOf(appLockRepository.getUnlockTimeDuration()) }
     var antiUninstallEnabled by remember { mutableStateOf(appLockRepository.isAntiUninstallEnabled()) }
     var disableHapticFeedback by remember { mutableStateOf(appLockRepository.shouldDisableHaptics()) }
@@ -275,6 +276,17 @@ fun SettingsScreen(
                             onCheckedChange = { isChecked ->
                                 useBiometricAuth = isChecked
                                 appLockRepository.setBiometricAuthEnabled(isChecked)
+                            }
+                        ),
+                        ToggleSettingItem(
+                            icon = Icons.Default.Bolt,
+                            title = stringResource(R.string.settings_screen_biometric_first_title),
+                            subtitle = stringResource(R.string.settings_screen_biometric_first_desc),
+                            checked = biometricFirst && useBiometricAuth && isBiometricAvailable,
+                            enabled = useBiometricAuth && isBiometricAvailable,
+                            onCheckedChange = { isChecked ->
+                                biometricFirst = isChecked
+                                appLockRepository.setBiometricFirstEnabled(isChecked)
                             }
                         ),
                         ToggleSettingItem(
@@ -758,6 +770,33 @@ fun BackendSelectionCard(
 ) {
     var selectedBackend by remember { mutableStateOf(appLockRepository.getBackendImplementation()) }
 
+    // When the user grants the Shizuku permission from the prompt we opened, switch to the
+    // Shizuku backend right away instead of making them tap the option a second time.
+    DisposableEffect(Unit) {
+        val listener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+            if (requestCode == SHIZUKU_PERMISSION_REQUEST_CODE &&
+                grantResult == PackageManager.PERMISSION_GRANTED
+            ) {
+                selectedBackend = BackendImplementation.SHIZUKU
+                appLockRepository.setBackendImplementation(BackendImplementation.SHIZUKU)
+                androidx.core.content.ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, ShizukuAppLockService::class.java)
+                )
+            }
+        }
+        try {
+            Shizuku.addRequestPermissionResultListener(listener)
+        } catch (_: Exception) {
+        }
+        onDispose {
+            try {
+                Shizuku.removeRequestPermissionResultListener(listener)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     Column {
         SectionTitle(text = stringResource(R.string.settings_screen_backend_implementation_title))
 
@@ -777,7 +816,7 @@ fun BackendSelectionCard(
                                         if (Shizuku.isPreV11()) {
                                             shizukuPermissionLauncher.launch(ShizukuProvider.PERMISSION)
                                         } else if (Shizuku.pingBinder()) {
-                                            Shizuku.requestPermission(423)
+                                            Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
                                         } else {
                                             Toast.makeText(
                                                 context,
@@ -790,7 +829,8 @@ fun BackendSelectionCard(
                                         appLockRepository.setBackendImplementation(
                                             BackendImplementation.SHIZUKU
                                         )
-                                        context.startService(
+                                        androidx.core.content.ContextCompat.startForegroundService(
+                                            context,
                                             Intent(context, ShizukuAppLockService::class.java)
                                         )
                                     }
@@ -810,7 +850,8 @@ fun BackendSelectionCard(
                                     }
                                     selectedBackend = backend
                                     appLockRepository.setBackendImplementation(BackendImplementation.USAGE_STATS)
-                                    context.startService(
+                                    androidx.core.content.ContextCompat.startForegroundService(
+                                        context,
                                         Intent(context, UsageLockService::class.java)
                                     )
                                 }
@@ -903,6 +944,8 @@ fun BackendSelectionItem(
         )
     )
 }
+
+private const val SHIZUKU_PERMISSION_REQUEST_CODE = 423
 
 private fun getBackendDisplayName(backend: BackendImplementation): String {
     return when (backend) {

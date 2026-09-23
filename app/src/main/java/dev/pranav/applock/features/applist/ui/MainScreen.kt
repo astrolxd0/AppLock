@@ -28,7 +28,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
@@ -569,14 +568,22 @@ private fun ProtectedAppItem(
 ) {
     val context = LocalContext.current
 
-    var appName by remember(appInfo) { mutableStateOf<String?>(null) }
-    var icon by remember(appInfo) { mutableStateOf<ImageBitmap?>(null) }
+    // Seed from the cache so already-loaded rows render fully on their first frame instead of
+    // flashing empty while a coroutine re-fetches them.
+    var appName by remember(appInfo) {
+        mutableStateOf(AppIconCache.getCachedLabel(appInfo.packageName))
+    }
+    var icon by remember(appInfo) {
+        mutableStateOf(AppIconCache.getCachedIcon(appInfo.packageName))
+    }
 
     LaunchedEffect(appInfo) {
-        withContext(Dispatchers.IO) {
-            appName = AppIconCache.getLabel(context, appInfo)
-            icon = AppIconCache.getIcon(context, appInfo)
+        if (appName != null && icon != null) return@LaunchedEffect
+        val (label, loadedIcon) = withContext(Dispatchers.IO) {
+            AppIconCache.getLabel(context, appInfo) to AppIconCache.getIcon(context, appInfo)
         }
+        appName = label
+        icon = loadedIcon
     }
 
     ListItem(
@@ -647,14 +654,22 @@ private fun SelectableAppItem(
 ) {
     val context = LocalContext.current
 
-    var appName by remember(appInfo) { mutableStateOf<String?>(null) }
-    var icon by remember(appInfo) { mutableStateOf<ImageBitmap?>(null) }
+    // Seed from the cache so already-loaded rows render fully on their first frame instead of
+    // flashing empty while a coroutine re-fetches them.
+    var appName by remember(appInfo) {
+        mutableStateOf(AppIconCache.getCachedLabel(appInfo.packageName))
+    }
+    var icon by remember(appInfo) {
+        mutableStateOf(AppIconCache.getCachedIcon(appInfo.packageName))
+    }
 
     LaunchedEffect(appInfo) {
-        withContext(Dispatchers.IO) {
-            appName = AppIconCache.getLabel(context, appInfo)
-            icon = AppIconCache.getIcon(context, appInfo)
+        if (appName != null && icon != null) return@LaunchedEffect
+        val (label, loadedIcon) = withContext(Dispatchers.IO) {
+            AppIconCache.getLabel(context, appInfo) to AppIconCache.getIcon(context, appInfo)
         }
+        appName = label
+        icon = loadedIcon
     }
 
     ListItem(

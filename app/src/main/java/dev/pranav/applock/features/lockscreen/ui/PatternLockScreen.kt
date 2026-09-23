@@ -36,7 +36,8 @@ fun PatternLockScreen(
     lockedAppName: String? = null,
     triggeringPackageName: String? = null,
     onPatternAttempt: ((pattern: String) -> Boolean)? = null,
-    onBiometricAuth: (() -> Unit)? = null
+    onBiometricAuth: (() -> Unit)? = null,
+    autoPromptBiometric: Boolean = true
 ) {
     val appLockRepository = LocalContext.current.appLockRepository()
     val context = LocalContext.current
@@ -173,7 +174,7 @@ fun PatternLockScreen(
                     verticalArrangement = Arrangement.SpaceBetween
                 ) {
                     LaunchedEffect(Unit) {
-                        if (appLockRepository.isBiometricAuthEnabled() && onBiometricAuth != null) {
+                        if (autoPromptBiometric && appLockRepository.isBiometricAuthEnabled() && onBiometricAuth != null) {
                             onBiometricAuth()
                         }
                     }
