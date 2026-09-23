@@ -58,6 +58,8 @@
             android:exported="false"
             android:launchMode="singleInstance"
             android:noHistory="true"
+            android:resizeableActivity="false"
+            android:supportsPictureInPicture="false"
             android:taskAffinity=""
             android:theme="@android:style/Theme.Material.NoActionBar.TranslucentDecor" />
 

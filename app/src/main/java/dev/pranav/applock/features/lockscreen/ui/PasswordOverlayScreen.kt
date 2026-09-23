@@ -1,13 +1,11 @@
 package dev.pranav.applock.features.lockscreen.ui
 
-import dev.pranav.applock.features.lockscreen.ui.AlphanumericPasswordOverlayScreen
 import android.content.Context
 import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.WindowManager
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.biometric.BiometricManager
@@ -32,6 +30,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
@@ -42,11 +42,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.toBitmap
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import dev.pranav.applock.R
 import dev.pranav.applock.core.ui.shapes
 import dev.pranav.applock.core.utils.appLockRepository
+import dev.pranav.applock.core.utils.goHome
 import dev.pranav.applock.core.utils.vibrate
 import dev.pranav.applock.core.utils.vibrateKeyTap
 import dev.pranav.applock.data.repository.AppLockRepository
@@ -55,7 +57,6 @@ import dev.pranav.applock.services.AppLockManager
 import dev.pranav.applock.ui.icons.Backspace
 import dev.pranav.applock.ui.icons.Fingerprint
 import dev.pranav.applock.ui.theme.AppLockTheme
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.util.concurrent.Executor
 
@@ -69,6 +70,13 @@ class PasswordOverlayActivity: FragmentActivity() {
 
     private var isBiometricPromptShowingLocal = false
     private var appName: String = ""
+    private var appIcon: ImageBitmap? = null
+
+    /** "Biometrics first": only the backdrop + system prompt until the user asks for the PIN. */
+    private var biometricFirst = false
+    private val showCredentialUi = mutableStateOf(true)
+    private val biometricStatus = mutableStateOf<String?>(null)
+    private val promptActive = mutableStateOf(false)
 
     private val TAG = "PasswordOverlayActivity"
 
@@ -86,13 +94,17 @@ class PasswordOverlayActivity: FragmentActivity() {
         enableEdgeToEdge()
 
         appLockRepository = applicationContext.appLockRepository()
+        biometricFirst = appLockRepository.isBiometricAuthEnabled() &&
+                appLockRepository.isBiometricFirstEnabled()
+        showCredentialUi.value = !biometricFirst
 
         onBackPressedDispatcher.addCallback(
             this,
             object: androidx.activity.OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    // Prevent back navigation to maintain security
-                    Log.d(TAG, "Back pressed ignored on AppLock overlay")
+                    // Back never reveals the locked app: leave it instead.
+                    Log.d(TAG, "Back pressed on AppLock overlay, going home")
+                    exitToHome()
                 }
             })
 
@@ -150,17 +162,25 @@ class PasswordOverlayActivity: FragmentActivity() {
     }
 
     private fun loadAppNameAndSetupUI() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                appName = packageManager.getApplicationLabel(
-                    packageManager.getApplicationInfo(lockedPackageNameFromIntent!!, 0)
-                ).toString()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error loading app name: ${e.message}")
-                appName = getString(R.string.default_app_name)
+        try {
+            val info = packageManager.getApplicationInfo(lockedPackageNameFromIntent!!, 0)
+            appName = packageManager.getApplicationLabel(info).toString()
+            appIcon = try {
+                packageManager.getApplicationIcon(info).toBitmap().asImageBitmap()
+            } catch (_: Exception) {
+                null
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading app name: ${e.message}")
+            appName = getString(R.string.default_app_name)
         }
         setupUI()
+    }
+
+    /** Leaves the locked app without unlocking it. */
+    private fun exitToHome() {
+        goHome()
+        finish()
     }
 
     private fun setupUI() {
@@ -194,6 +214,20 @@ class PasswordOverlayActivity: FragmentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     contentColor = MaterialTheme.colorScheme.primaryContainer
                 ) { innerPadding ->
+                    if (!showCredentialUi.value) {
+                        BiometricBackdropScreen(
+                            modifier = Modifier.padding(innerPadding),
+                            appName = appName,
+                            appIcon = appIcon,
+                            statusText = biometricStatus.value,
+                            promptActive = promptActive.value,
+                            onRetry = { triggerBiometricPrompt() },
+                            onUseCredential = { showCredentialUi.value = true },
+                            onClose = { exitToHome() }
+                        )
+                        return@Scaffold
+                    }
+
                     val lockType = appLockRepository.getLockType()
                     when (lockType) {
                         PreferencesRepository.LOCK_TYPE_PATTERN -> {
@@ -202,7 +236,11 @@ class PasswordOverlayActivity: FragmentActivity() {
                                 fromMainActivity = false,
                                 lockedAppName = appName,
                                 triggeringPackageName = triggeringPackageNameFromIntent,
-                                onPatternAttempt = onPatternAttemptCallback
+                                onPatternAttempt = onPatternAttemptCallback,
+                                onBiometricAuth = { triggerBiometricPrompt() },
+                                autoPromptBiometric = false,
+                                showCloseButton = true,
+                                onClose = { exitToHome() }
                             )
                         }
 
@@ -217,7 +255,7 @@ class PasswordOverlayActivity: FragmentActivity() {
                                 triggeringPackageName = triggeringPackageNameFromIntent,
                                 onPasswordAttempt = onPinAttemptCallback,
                                 showCloseButton = true,
-                                onClose = { finish() }
+                                onClose = { exitToHome() }
                             )
                         }
 
@@ -232,10 +270,8 @@ class PasswordOverlayActivity: FragmentActivity() {
                                 triggeringPackageName = triggeringPackageNameFromIntent,
                                 onPinAttempt = onPinAttemptCallback,
                                 showCloseButton = true,
-                                onClose = { finish() }
+                                onClose = { exitToHome() }
                             )
-
-                            BackHandler { }
                         }
                     }
                 }
@@ -266,13 +302,47 @@ class PasswordOverlayActivity: FragmentActivity() {
             override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                 super.onAuthenticationError(errorCode, errString)
                 isBiometricPromptShowingLocal = false
+                promptActive.value = false
                 AppLockManager.reportBiometricAuthFinished()
                 Log.w(TAG, "Authentication error: $errString ($errorCode)")
+
+                when (errorCode) {
+                    BiometricPrompt.ERROR_NEGATIVE_BUTTON -> {
+                        // "Use PIN"
+                        showCredentialUi.value = true
+                    }
+
+                    BiometricPrompt.ERROR_USER_CANCELED -> {
+                        // In biometrics-first mode a dismissed prompt means "never mind":
+                        // leave the app instead of dropping the user on the PIN pad.
+                        if (biometricFirst && !showCredentialUi.value) {
+                            exitToHome()
+                        }
+                    }
+
+                    BiometricPrompt.ERROR_CANCELED -> {
+                        biometricStatus.value = getString(R.string.biometric_prompt_interrupted)
+                    }
+
+                    BiometricPrompt.ERROR_LOCKOUT,
+                    BiometricPrompt.ERROR_LOCKOUT_PERMANENT,
+                    BiometricPrompt.ERROR_HW_UNAVAILABLE,
+                    BiometricPrompt.ERROR_HW_NOT_PRESENT,
+                    BiometricPrompt.ERROR_NO_BIOMETRICS -> {
+                        biometricStatus.value = errString.toString()
+                        showCredentialUi.value = true
+                    }
+
+                    else -> {
+                        biometricStatus.value = errString.toString().ifBlank { null }
+                    }
+                }
             }
 
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                 super.onAuthenticationSucceeded(result)
                 isBiometricPromptShowingLocal = false
+                promptActive.value = false
                 lockedPackageNameFromIntent?.let { pkgName ->
                     AppLockManager.temporarilyUnlockAppWithBiometrics(pkgName)
                     // Fix: Do NOT relaunch the app. Just finish the overlay to reveal the underlying activity.
@@ -303,14 +373,19 @@ class PasswordOverlayActivity: FragmentActivity() {
 
     fun triggerBiometricPrompt() {
         if (appLockRepository.isBiometricAuthEnabled()) {
+            if (isBiometricPromptShowingLocal) return
             AppLockManager.reportBiometricAuthStarted()
             isBiometricPromptShowingLocal = true
+            promptActive.value = true
+            biometricStatus.value = null
             try {
                 biometricPrompt.authenticate(promptInfo)
             } catch (e: Exception) {
                 Log.e(TAG, "Error calling biometricPrompt.authenticate: ${e.message}", e)
                 isBiometricPromptShowingLocal = false
+                promptActive.value = false
                 AppLockManager.reportBiometricAuthFinished()
+                showCredentialUi.value = true
             }
         }
     }
